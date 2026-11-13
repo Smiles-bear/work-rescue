@@ -1,0 +1,14 @@
+.venv/
+.tools/
+.demo/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.egg-info/
+dist/
+build/
+*.svg
+.coverage
+/docs/TEST-RESULTS.json
+/docs/TEST-RESULTS.txt
+
