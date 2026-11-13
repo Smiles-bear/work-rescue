@@ -13,7 +13,7 @@ import time
 import unicodedata
 import uuid
 from contextlib import closing
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
@@ -22,6 +22,10 @@ from filelock import FileLock, Timeout
 
 class RescueError(Exception):
     """A recoverable failure suitable for display without a traceback."""
+
+
+class WorktreeChanged(RescueError):
+    """The registered checkout needs user confirmation before it can be captured."""
 
 
 def now() -> str:
@@ -109,12 +113,25 @@ def open_regular(source: Path):
 
 
 @dataclass
+class WorktreeBinding:
+    git_dir: str
+    common_dir: str
+    root_device: int
+    root_inode: int
+    git_device: int
+    git_inode: int
+    paused: bool = False
+    history_only: bool = False
+
+
+@dataclass
 class Project:
     id: str
     name: str
     root: str
     include_ignored: list[str] = field(default_factory=list)
     goal: str = ""
+    worktree: WorktreeBinding | None = None
 
 
 class State:
@@ -157,14 +174,8 @@ class State:
             original = next((p for p in projects if p.id == project_id), None)
             if original is None or any(p.name == name and p.id != project_id for p in projects):
                 raise RescueError("项目不存在或名称重复")
-            updated = Project(original.id, name, original.root, includes, goal)
-            atomic_json(
-                self.config,
-                {
-                    "schema_version": 1,
-                    "projects": [asdict(updated if p.id == project_id else p) for p in projects],
-                },
-            )
+            updated = replace(original, name=name, include_ignored=includes, goal=goal)
+            self._write_projects([updated if p.id == project_id else p for p in projects])
         return updated
 
     def projects(self) -> list[Project]:
@@ -174,7 +185,13 @@ class State:
             data = json.loads(self.config.read_text(encoding="utf-8"))
             if data["schema_version"] != 1:
                 raise ValueError("Unsupported project configuration version")
-            return [Project(**p) for p in data["projects"]]
+            bindings = data.get("worktrees", {})
+            return [
+                Project(**p, worktree=WorktreeBinding(**bindings[p["id"]]))
+                if p["id"] in bindings
+                else Project(**p)
+                for p in data["projects"]
+            ]
         except (ValueError, KeyError, TypeError) as exc:
             raise RescueError(f"项目配置无法读取；没有覆盖原文件：{exc}") from exc
 
@@ -185,6 +202,30 @@ class State:
         return found[0]
 
     def add(self, name: str, root: Path, includes: list[str], goal: str) -> Project:
+        return self._add(name, root, includes, goal)
+
+    def _write_projects(self, projects: list[Project]) -> None:
+        rows, bindings = [], {}
+        for project in projects:
+            row = asdict(project)
+            binding = row.pop("worktree")
+            if binding is not None:
+                bindings[project.id] = binding
+            rows.append(row)
+        data = {"schema_version": 1, "projects": rows}
+        if bindings:
+            data["worktrees"] = bindings
+        atomic_json(self.config, data)
+
+    def _add(
+        self,
+        name: str,
+        root: Path,
+        includes: list[str],
+        goal: str,
+        binding: WorktreeBinding | None = None,
+        replace_paused: bool = False,
+    ) -> Project:
         root = root.expanduser().resolve(strict=True)
         if not root.is_dir() or overlaps(root, self.home):
             raise RescueError("项目必须是目录，且不能与恢复助手的数据目录相互包含")
@@ -192,18 +233,69 @@ class State:
             raise RescueError("项目名称不能为空")
         with FileLock(str(self.home / "config.lock"), timeout=5):
             projects = self.projects()
-            if any(p.name == name or Path(p.root) == root for p in projects):
-                raise RescueError("项目名称或目录已经存在")
-            project = Project(uuid.uuid4().hex, name, str(root), includes, goal)
-            atomic_json(
-                self.config,
-                {"schema_version": 1, "projects": [asdict(p) for p in projects + [project]]},
-            )
+            for index, prior in enumerate(projects):
+                if prior.name == name:
+                    raise RescueError("项目名称已经存在，请使用另一个名称")
+                if Path(prior.root) != root or (prior.worktree and prior.worktree.history_only):
+                    continue
+                if not (replace_paused and prior.worktree and prior.worktree.paused):
+                    raise RescueError("项目目录已经存在")
+                projects[index] = replace(
+                    prior, worktree=replace(prior.worktree, history_only=True)
+                )
+            project = Project(uuid.uuid4().hex, name, str(root), includes, goal, binding)
+            self._write_projects(projects + [project])
         return project
+
+    def register_worktree(
+        self,
+        source_id: str,
+        root: Path,
+        name: str,
+        includes: list[str],
+        goal: str,
+        replace_paused: bool = False,
+    ) -> Project:
+        from .git_worktrees import discover, identify
+
+        root = root.absolute()
+        source = self.get(source_id)
+        listing = discover(self, source)
+        row = next((row for row in listing["worktrees"] if Path(row["path"]) == root), None)
+        if not row or row["directory"] != "available":
+            raise RescueError(listing["error"] or "该工作树已不可用，请刷新工作树列表")
+        if replace_paused and row["coverage"] != "paused":
+            raise RescueError("只有已暂停的工作树可登记替换目录")
+        binding = identify(root, Path(listing["common_dir"]))
+        if row["project_id"] and not replace_paused:
+            with FileLock(str(self.home / "config.lock"), timeout=5):
+                projects = self.projects()
+                for index, project in enumerate(projects):
+                    if project.id == row["project_id"] and project.worktree is None:
+                        if Path(project.root) != root:
+                            break
+                        updated = replace(project, worktree=binding)
+                        projects[index] = updated
+                        self._write_projects(projects)
+                        return updated
+                raise RescueError("该目录已经绑定，请刷新工作树列表")
+        return self._add(name, root, includes, goal, binding, replace_paused)
+
+    def pause_worktree(self, project: Project) -> None:
+        if project.worktree is None:
+            return
+        with FileLock(str(self.home / "config.lock"), timeout=5):
+            projects = self.projects()
+            for index, current in enumerate(projects):
+                if current.id == project.id and current.worktree == project.worktree:
+                    projects[index] = replace(
+                        current, worktree=replace(current.worktree, paused=True)
+                    )
+                    self._write_projects(projects)
+                    return
 
 
 DEFAULT_DIRS = {
-    ".git",
     ".venv",
     "venv",
     "node_modules",
@@ -213,6 +305,24 @@ DEFAULT_DIRS = {
     ".ruff_cache",
 }
 SECRET_NAMES = {".env", "id_rsa", "id_ed25519", "credentials.json", "auth.json"}
+
+
+def git_metadata(relative: str) -> bool:
+    return any(part.casefold() == ".git" for part in relative.split("/"))
+
+
+def recoverable_files(manifest: dict) -> list[dict]:
+    return [entry for entry in manifest["files"] if not git_metadata(entry["path"])]
+
+
+def stage_recovery(payload: Path, entries: list[dict], staged: Path) -> None:
+    staged.mkdir()
+    for entry in entries:
+        target = staged / entry["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(payload / entry["path"], target)
+        if os.name != "nt":
+            target.chmod(entry["mode"] & 0o777)
 
 
 def scan(project: Project) -> dict:
@@ -393,11 +503,24 @@ class Engine:
             raise RescueError("备份仓库与应用数据目录不能与项目相互包含")
         try:
             with FileLock(str(self.state.home / f"{project.id}.lock"), timeout=0):
-                return self._checkpoint(project, previous_signature)
+                current = self._capture_project(project)
+                try:
+                    return self._checkpoint(current, previous_signature)
+                except WorktreeChanged:
+                    if current.worktree and not current.worktree.paused:
+                        self.state.pause_worktree(current)
+                    raise
         except Timeout as exc:
             raise RescueError("该项目已有保存任务正在运行") from exc
 
+    def _capture_project(self, project: Project) -> Project:
+        current = next((p for p in self.state.projects() if p.id == project.id), project)
+        return replace(project, worktree=current.worktree)
+
     def _checkpoint(self, project: Project, previous_signature: str | None = None) -> dict:
+        from .git_worktrees import validate_binding
+
+        validate_binding(project)
         started = now()
         coverage = scan(project)
         root = Path(project.root)
@@ -444,9 +567,13 @@ class Engine:
                     }
                 )
             validate_paths([entry["path"] for entry in entries], windows=False, insensitive=False)
+            project_record = asdict(project)
+            binding = project_record.pop("worktree")
+            if binding:
+                project_record["git_common_dir"] = binding["common_dir"]
             manifest = {
                 "schema_version": 1,
-                "project": asdict(project),
+                "project": project_record,
                 "started_at": started,
                 "completed_at": now(),
                 "files": entries,
@@ -460,6 +587,10 @@ class Engine:
                     ensure_ascii=False,
                 ).encode("utf-8")
             ).hexdigest()
+            latest = self._capture_project(project)
+            if latest.worktree != project.worktree:
+                raise RescueError("保存期间工作树登记已变化，请重试")
+            validate_binding(project)
             if signature == previous_signature:
                 return {
                     "unchanged": True,
@@ -532,11 +663,16 @@ class Engine:
         record = self._exact_snapshot(snapshot)
         self.backend.run("check", "--read-data")
         with tempfile.TemporaryDirectory(prefix="verify-", dir=self.state.home) as name:
-            manifest, _ = self._extract(record["id"], Path(name) / "restore")
+            directory = Path(name)
+            manifest, payload = self._extract(record["id"], directory / "extracted")
+            entries = recoverable_files(manifest)
+            stage_recovery(payload, entries, directory / "recovered")
         result = {
             "snapshot_id": record["id"],
             "verified_at": now(),
             "file_count": len(manifest["files"]),
+            "recoverable_file_count": len(entries),
+            "excluded_git_metadata_count": len(manifest["files"]) - len(entries),
             "rehearsal": "passed",
             "native_session": "not_verified",
         }
@@ -544,12 +680,15 @@ class Engine:
         return result
 
     def diff(self, snapshot: str, project: Project) -> dict:
+        from .git_worktrees import validate_binding
+
         with tempfile.TemporaryDirectory(prefix="diff-", dir=self.state.home) as name:
             manifest, _ = self._extract(snapshot, Path(name) / "restore")
         if manifest["project"]["id"] != project.id:
             raise RescueError("检查点与当前项目不匹配")
+        validate_binding(self._capture_project(project))
         current = set(scan(project)["files"])
-        saved = {entry["path"]: entry for entry in manifest["files"]}
+        saved = {entry["path"]: entry for entry in recoverable_files(manifest)}
         changed, missing, database_review = [], [], []
         for relative, entry in saved.items():
             path = Path(project.root) / relative
@@ -573,7 +712,7 @@ class Engine:
         return {
             "goal_confirmed_by_user": manifest["project"]["goal"],
             "captured_at": manifest["completed_at"],
-            "files": [entry["path"] for entry in manifest["files"]],
+            "files": [entry["path"] for entry in recoverable_files(manifest)],
             "tests_in_recovered_directory": "not_run",
             "external_side_effects": "unknown",
             "native_session": "not_verified",
@@ -591,16 +730,11 @@ class Engine:
         return results
 
     def restore(self, snapshot: str, destination: Path) -> dict:
-        # Refuse symlink/junction ancestors before resolving the user's target.
+        from .git_worktrees import related_paths
+
         absolute = Path(os.path.abspath(destination.expanduser()))
-        for ancestor in [absolute, *absolute.parents]:
-            if os.path.lexists(ancestor) and linked(ancestor):
-                raise RescueError("恢复路径不能经过符号链接或重解析点")
+        check_restore_target(absolute)
         target = absolute.resolve()
-        if os.path.lexists(target):
-            raise RescueError("目标目录已存在；请选择全新目录")
-        if not target.parent.is_dir():
-            raise RescueError("目标的上级目录不存在")
         protected = [self.state.home, self.backend.repository]
         protected += [Path(p.root).resolve() for p in self.state.projects()]
         if any(overlaps(target, path) for path in protected):
@@ -609,42 +743,68 @@ class Engine:
         try:
             with (
                 lock,
-                tempfile.TemporaryDirectory(prefix=".work-rescue-", dir=target.parent) as name,
+                tempfile.TemporaryDirectory(prefix="restore-", dir=self.state.home) as name,
             ):
                 manifest, payload = self._extract(snapshot, Path(name) / "extracted")
                 # Also protect the source when recovering with an empty local configuration.
                 source = Path(manifest["project"]["root"]).resolve()
                 if overlaps(target, source):
                     raise RescueError("恢复目标不能包含原项目或位于原项目内")
-                for entry in manifest["files"]:
-                    if os.name != "nt":
-                        (payload / entry["path"]).chmod(entry["mode"] & 0o777)
-                if os.path.lexists(target):
-                    raise RescueError("恢复期间目标已被创建，拒绝覆盖")
-                # Reserve the destination without ever replacing an existing directory.
-                operation = {
-                    "snapshot_id": snapshot,
-                    "destination": str(target),
-                    "started_at": now(),
-                    "status": "writing",
-                }
-                journal = self.state.home / "operations" / f"{uuid.uuid4().hex}.json"
-                atomic_json(journal, operation)
-                target.mkdir()
-                try:
-                    for child in payload.iterdir():
-                        shutil.move(str(child), target / child.name)
-                    operation.update(status="complete", completed_at=now())
-                    atomic_json(journal, operation)
-                except (OSError, RescueError) as exc:
-                    # A partial *new* destination is retained, never advertised as complete.
-                    operation.update(status="incomplete", error=str(exc))
-                    atomic_json(journal, operation)
-                    raise RescueError(f"恢复未完成；部分结果保留在 {target}，原项目未改动") from exc
+                if any(
+                    overlaps(target, path)
+                    for path in related_paths(source, manifest["project"].get("git_common_dir"))
+                ):
+                    raise RescueError("请在原仓库的工作树与 Git 管理目录之外选择恢复目标")
+                entries = recoverable_files(manifest)
+                check_restore_target(target)
+                with tempfile.TemporaryDirectory(
+                    prefix=".work-rescue-", dir=target.parent
+                ) as staging:
+                    staged = Path(staging) / "files"
+                    stage_recovery(payload, entries, staged)
+                    self._publish(snapshot, staged, target)
         except Timeout as exc:
             raise RescueError("已有恢复任务正在运行") from exc
         return {
             "destination": str(target),
-            "files": len(manifest["files"]),
+            "files": len(entries),
+            "excluded_git_metadata_count": len(manifest["files"]) - len(entries),
             "native_session": "not_verified",
         }
+
+    def _publish(self, snapshot: str, staged: Path, target: Path) -> None:
+        check_restore_target(target)
+        operation = {
+            "snapshot_id": snapshot,
+            "destination": str(target),
+            "started_at": now(),
+            "status": "writing",
+        }
+        journal = self.state.home / "operations" / f"{uuid.uuid4().hex}.json"
+        atomic_json(journal, operation)
+        try:
+            target.mkdir()
+        except OSError as exc:
+            operation.update(status="incomplete", error=str(exc))
+            atomic_json(journal, operation)
+            raise
+        try:
+            for child in staged.iterdir():
+                shutil.move(str(child), target / child.name)
+            operation.update(status="complete", completed_at=now())
+            atomic_json(journal, operation)
+        except (OSError, RescueError) as exc:
+            operation.update(status="incomplete", error=str(exc))
+            atomic_json(journal, operation)
+            raise RescueError(f"恢复未完成；部分结果保留在 {target}，原项目未改动") from exc
+
+
+def check_restore_target(target: Path) -> None:
+    # Check the original path so resolution cannot hide a redirected ancestor.
+    for ancestor in target.parents:
+        if os.path.lexists(ancestor) and linked(ancestor):
+            raise RescueError("恢复路径不能经过符号链接或重解析点")
+    if os.path.lexists(target):
+        raise RescueError("目标目录已存在；请选择全新目录")
+    if not target.parent.is_dir():
+        raise RescueError("目标的上级目录不存在")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import unicodedata
 from pathlib import Path
 
 from rich.text import Text
@@ -13,10 +15,29 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Ric
 
 from . import watch
 from .core import Engine, Project, RescueError, scan
+from .git_worktrees import discover
 
 
 def plain(value) -> Text:
     return Text(re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "�", str(value)))
+
+
+def tree_text(value: str) -> str:
+    return "".join(
+        char if unicodedata.category(char) not in ("Cc", "Cf") else ascii(char)[1:-1]
+        for char in value
+    )
+
+
+def verification_label(engine: Engine, snapshot: str) -> str:
+    receipt = engine.state.home / "verification" / f"{snapshot}.json"
+    try:
+        value = json.loads(receipt.read_text(encoding="utf-8"))
+        if value.get("snapshot_id") == snapshot and value.get("rehearsal") == "passed":
+            return "已通过" if "recoverable_file_count" in value else "旧版验证"
+    except (OSError, ValueError, AttributeError):
+        pass
+    return "未演练"
 
 
 class Form(ModalScreen[dict | None]):
@@ -36,7 +57,7 @@ class Form(ModalScreen[dict | None]):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Label(self.heading)
+            yield Label(self.heading, markup=False)
             for key, label in self.fields:
                 yield Label(label)
                 yield Input(value=self.values.get(key, ""), id=key)
@@ -54,6 +75,161 @@ class Form(ModalScreen[dict | None]):
             self.dismiss(None)
 
 
+class WorktreeScreen(ModalScreen[tuple[str, dict] | None]):
+    BINDINGS = (("escape", "close", "返回"),)
+    DEFAULT_CSS = """
+    WorktreeScreen { align: center middle; background: $background 70%; }
+    WorktreeScreen > Vertical { width: 96%; height: 88%; border: round $accent;
+        padding: 0 1; background: $surface; }
+    WorktreeScreen DataTable { height: 1fr; }
+    WorktreeScreen #tree-info { height: auto; max-height: 5; }
+    WorktreeScreen Horizontal { height: 3; }
+    WorktreeScreen Button { width: 1fr; min-width: 9; }
+    """
+
+    def __init__(self, engine: Engine, source: Project):
+        super().__init__()
+        self.engine, self.source = engine, source
+        self.rows = []
+        self.discovery_error = None
+        self.latest = None
+
+    def compose(self):
+        with Vertical():
+            yield Label(f"工作树 · {self.source.name}", markup=False)
+            yield DataTable(id="worktree-list", cursor_type="row")
+            yield Static("正在查找工作树…", id="tree-info", markup=False)
+            with Horizontal():
+                yield Button("打开项目", id="tree-open", disabled=True)
+                yield Button("登记", id="tree-register", disabled=True)
+                yield Button("刷新", id="tree-refresh")
+                yield Button("返回", id="tree-close")
+
+    def on_mount(self):
+        table = self.query_one(DataTable)
+        for label, width in (
+            ("路径", 30),
+            ("分支", 12),
+            ("保护", 16),
+            ("最近保存", 19),
+            ("演练", 9),
+        ):
+            table.add_column(label, width=width)
+        self.refresh_worktrees()
+
+    def collect(self):
+        listing = discover(self.engine.state, self.source)
+        latest = {}
+        try:
+            if any(row["project_id"] for row in listing["worktrees"]):
+                for record in self.engine.backend.snapshots():
+                    for tag in record.get("tags", []):
+                        if tag.startswith("wr:project:"):
+                            latest.setdefault(tag.removeprefix("wr:project:"), record)
+        except (RescueError, OSError, ValueError):
+            return listing, None
+        return listing, latest
+
+    @work(exclusive=True, group="worktree-discovery")
+    async def refresh_worktrees(self):
+        self.query_one("#tree-info", Static).update("正在查找工作树…")
+        try:
+            listing, latest = await asyncio.to_thread(self.collect)
+        except (RescueError, OSError, ValueError) as exc:
+            listing, latest = {"worktrees": [], "error": str(exc)}, None
+        table = self.query_one(DataTable)
+        selected = self.rows[table.cursor_row]["path"] if self.rows else None
+        self.rows = listing["worktrees"]
+        self.discovery_error = listing["error"]
+        self.latest = latest
+        table.clear()
+        for index, row in enumerate(self.rows):
+            record = latest.get(row["project_id"]) if latest is not None else None
+            saved = record["time"][:19] if record else "未知" if latest is None else "—"
+            coverage = {
+                "bound": "已登记",
+                "registered": "已登记目录",
+                "paused": "已暂停",
+                "unregistered": "仅保护子目录" if row["partial_projects"] else "未登记",
+            }[row["coverage"]]
+            if row["project_id"]:
+                project = self.engine.state.get(row["project_id"])
+                if watch.status(self.engine.state, project)["running"]:
+                    coverage += " · 后台运行"
+            branch = "detached" if row["detached"] else (row["branch"] or "—")
+            table.add_row(
+                plain(tree_text(row["path"])),
+                plain(tree_text(branch.removeprefix("refs/heads/"))),
+                coverage,
+                saved,
+                verification_label(self.engine, record["id"]) if record else "—",
+            )
+            if selected == row["path"]:
+                table.move_cursor(row=index)
+        if self.rows:
+            self.show_row(table.cursor_row)
+            table.focus()
+        else:
+            self.query_one("#tree-open", Button).disabled = True
+            self.query_one("#tree-register", Button).disabled = True
+            self.query_one("#tree-info", Static).update(plain(listing["error"] or "没有工作树"))
+
+    def show_row(self, index):
+        if not 0 <= index < len(self.rows):
+            return
+        row = self.rows[index]
+        directory = {
+            "available": "目录可用",
+            "missing": "目录已缺失",
+            "bare": "裸仓库",
+            "unavailable": "目录不可用",
+            "unsupported_path": "文件名无法表示",
+            "not_listed": "Git 列表中无此目录，可查看已保存历史",
+        }
+        details = [directory[row["directory"]], tree_text(row["path"])]
+        if self.latest is not None and (record := self.latest.get(row["project_id"])):
+            details.append(f"最近检查点 {record['id'][:12]}")
+        if row["partial_projects"]:
+            details.append("子目录项目 " + tree_text("、".join(row["partial_projects"])))
+        if self.discovery_error:
+            details.append(tree_text(self.discovery_error))
+        for key, label in (("locked", "Git 已锁定"), ("prunable", "Git 记录可清理")):
+            if row[key] is not None:
+                details.append(f"{label} {tree_text(row[key])}".strip())
+        self.query_one("#tree-info", Static).update(plain("  |  ".join(details)))
+        self.query_one("#tree-open", Button).disabled = not row["project_id"]
+        button = self.query_one("#tree-register", Button)
+        button.disabled = row["directory"] != "available" or row["coverage"] == "bound"
+        button.label = {"paused": "登记替换目录", "registered": "绑定已有项目"}.get(
+            row["coverage"], "登记"
+        )
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted):
+        self.show_row(event.cursor_row)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected):
+        event.stop()
+        row = self.rows[event.cursor_row]
+        if row["project_id"]:
+            self.dismiss(("open", row))
+        elif row["directory"] == "available":
+            self.dismiss(("register", row))
+
+    def action_close(self):
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed):
+        event.stop()
+        action = event.button.id
+        if action == "tree-close":
+            self.action_close()
+        elif action == "tree-refresh":
+            self.refresh_worktrees()
+        elif self.rows:
+            row = self.rows[self.query_one(DataTable).cursor_row]
+            self.dismiss(("open" if action == "tree-open" else "register", row))
+
+
 class RescueApp(App):
     TITLE = "WORK RESCUE · 工作恢复助手"
     SUB_TITLE = "本地加密检查点 / 隔离恢复 / 原会话继续尚未验证"
@@ -66,7 +242,7 @@ class RescueApp(App):
     .heading { height: 1; padding: 0 1; color: $accent; text-style: bold; }
     #projects { height: 1fr; }
     #snapshots { height: 1fr; }
-    #actions { height: auto; layout: grid; grid-size: 4; grid-rows: 3; }
+    #actions { height: auto; layout: grid; grid-size: 5; grid-rows: 3; }
     #actions Button { width: 1fr; min-width: 8; }
     #details { height: 9; border: round $primary-muted; }
     .narrow #workspace { layout: vertical; }
@@ -81,6 +257,7 @@ class RescueApp(App):
         ("v", "verify", "验证"),
         ("r", "restore", "恢复"),
         ("e", "edit_project", "编辑项目"),
+        ("w", "worktrees", "工作树"),
         ("f2", "settings", "设置"),
         ("ctrl+r", "refresh", "刷新"),
         ("q", "quit", "退出界面"),
@@ -91,6 +268,8 @@ class RescueApp(App):
         self.engine = engine
         self.selected_project: Project | None = None
         self.selected_snapshot: str | None = None
+        self.snapshot_project_id: str | None = None
+        self.snapshot_load = 0
         self.busy = False
 
     def compose(self) -> ComposeResult:
@@ -117,6 +296,7 @@ class RescueApp(App):
                 ("refresh", "刷新"),
                 ("edit", "编辑项目"),
                 ("settings", "设置"),
+                ("worktrees", "工作树"),
             ]:
                 yield Button(label, id=key, variant="primary" if key == "save" else "default")
         yield RichLog(id="details", wrap=True, markup=False, highlight=False)
@@ -141,6 +321,8 @@ class RescueApp(App):
             value = watch.status(self.engine.state, self.selected_project)
             state = "运行中" if value["running"] else "未运行"
             message = f"{self.selected_project.name}  |  独立后台：{state}"
+            if self.selected_project.worktree and not Path(self.selected_project.root).is_dir():
+                message += "  |  工作树目录不可用，可恢复已保存的检查点"
             if value.get("last_success"):
                 message += f"  |  最近自动保存：{value['last_success']['completed_at']}"
             if value.get("last_error"):
@@ -175,9 +357,15 @@ class RescueApp(App):
         table = self.query_one("#projects", DataTable)
         table.clear()
         for project in projects:
-            table.add_row(plain(project.name), key=project.id)
-        if not self.selected_project and projects:
-            self.selected_project = projects[0]
+            label = project.name
+            if project.worktree:
+                label += " · 历史" if project.worktree.history_only else " · 工作树"
+            table.add_row(plain(label), key=project.id)
+        selected = self.selected_project.id if self.selected_project else None
+        self.selected_project = next((p for p in projects if p.id == selected), None)
+        if projects:
+            self.selected_project = self.selected_project or projects[0]
+            table.move_cursor(row=projects.index(self.selected_project))
         if self.selected_project:
             await self.load_snapshots()
         self.update_status()
@@ -186,18 +374,27 @@ class RescueApp(App):
         project = self.selected_project
         if project is None:
             return
-        records = await self.perform(self.engine.backend.snapshots, project.id)
-        if records is None or project != self.selected_project:
+        table = self.query_one("#snapshots", DataTable)
+        if self.snapshot_project_id != project.id:
+            self.snapshot_project_id = project.id
+            table.clear()
+        self.snapshot_load += 1
+        request = self.snapshot_load
+        try:
+            records = await asyncio.to_thread(self.engine.backend.snapshots, project.id)
+        except (RescueError, OSError, ValueError) as exc:
+            if request == self.snapshot_load:
+                self.write_log(f"无法读取检查点：{exc}")
+            return
+        if request != self.snapshot_load or project != self.selected_project:
             return
         previous = self.selected_snapshot
-        table = self.query_one("#snapshots", DataTable)
         table.clear()
         for record in records:
-            verified = (self.engine.state.home / "verification" / f"{record['id']}.json").exists()
             table.add_row(
                 plain(record["time"][:19]),
                 record["id"][:8],
-                "已通过" if verified else "未演练",
+                verification_label(self.engine, record["id"]),
                 key=record["id"],
             )
         identifiers = [record["id"] for record in records]
@@ -214,9 +411,60 @@ class RescueApp(App):
             self.selected_snapshot = None
             await self.load_snapshots()
             self.update_status()
-        else:
+        elif event.data_table.id == "snapshots":
             self.selected_snapshot = str(event.row_key.value)
             self.write_log(f"已选择检查点：{self.selected_snapshot[:12]}")
+
+    @work(group="operation")
+    async def action_worktrees(self):
+        source = self.selected_project
+        if not source:
+            self.write_log("请先添加或选择项目。")
+            return
+        choice = await self.push_screen_wait(WorktreeScreen(self.engine, source))
+        if not choice:
+            return
+        action, row = choice
+        if action == "open":
+            self.selected_project = self.engine.state.get(row["project_id"])
+        else:
+            root = Path(row["path"])
+            if row["coverage"] == "registered":
+                data = await self.push_screen_wait(Form(f"绑定已有项目 {tree_text(str(root))}", []))
+                if data is not None:
+                    data = {"name": row["project_name"], "include": "", "goal": ""}
+            else:
+                title = "登记新工作树"
+                if row["coverage"] == "paused":
+                    title = "登记新工作树并保留旧项目的恢复历史"
+                data = await self.push_screen_wait(
+                    Form(
+                        f"{title} · {tree_text(str(root))}",
+                        [
+                            ("name", "名称"),
+                            ("include", "显式包含的忽略产物（逗号分隔）"),
+                            ("goal", "任务目标（可选）"),
+                        ],
+                        {"name": tree_text(root.name)},
+                    )
+                )
+            if data is None:
+                return
+            project = await self.perform(
+                self.engine.state.register_worktree,
+                source.id,
+                root,
+                data["name"],
+                [s.strip() for s in data["include"].split(",") if s.strip()],
+                data["goal"],
+                row["coverage"] == "paused",
+            )
+            if not project:
+                return
+            self.selected_project = project
+            self.write_log("工作树已登记。可查看保护范围、保存或开启独立后台。")
+        self.selected_snapshot = None
+        self.action_refresh()
 
     @work(group="operation")
     async def action_add_project(self):
@@ -309,16 +557,18 @@ class RescueApp(App):
 
     @work(group="operation")
     async def action_save(self):
-        if not self.selected_project:
+        project = self.selected_project
+        if not project:
             self.write_log("请先添加或选择项目。")
             return
-        result = await self.perform(self.engine.checkpoint, self.selected_project)
+        result = await self.perform(self.engine.checkpoint, project)
         if result:
-            self.selected_snapshot = result["id"]
             self.write_log(
                 f"已保存 {result['file_count']} 个文件；检查点 {result['id'][:12]}。尚未演练。"
             )
-            await self.load_snapshots()
+            if self.selected_project and self.selected_project.id == project.id:
+                self.selected_snapshot = result["id"]
+                await self.load_snapshots()
 
     @work(group="operation")
     async def action_verify(self):
@@ -327,7 +577,9 @@ class RescueApp(App):
             return
         result = await self.perform(self.engine.verify, self.selected_snapshot)
         if result:
-            self.write_log(f"恢复演练通过：{result['file_count']} 个文件。原生会话继续未验证。")
+            count = result["recoverable_file_count"]
+            skipped = result["excluded_git_metadata_count"]
+            self.write_log(f"恢复演练通过，可恢复 {count} 个文件，排除 {skipped} 个 Git 管理条目。")
             await self.load_snapshots()
 
     @work(group="operation")
@@ -350,7 +602,7 @@ class RescueApp(App):
     @work(group="operation")
     async def on_button_pressed(self, event: Button.Pressed):
         key = event.button.id
-        if key in ("add", "save", "verify", "restore", "refresh", "edit", "settings"):
+        if key in ("add", "save", "verify", "restore", "refresh", "edit", "settings", "worktrees"):
             action = {"add": "add_project", "edit": "edit_project"}.get(key, key)
             getattr(self, "action_" + action)()
         elif self.selected_project:

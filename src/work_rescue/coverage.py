@@ -59,6 +59,7 @@ def scan(project) -> dict:
         SECRET_NAMES,
         RescueError,
         check_source_path,
+        git_metadata,
         linked,
         open_regular,
     )
@@ -117,6 +118,9 @@ def scan(project) -> dict:
             for entry in entries:
                 path = folder / entry.name
                 relative = path.relative_to(root).as_posix()
+                if git_metadata(entry.name):
+                    exclude(relative, "Git 管理数据或指针，不采集")
+                    continue
                 info = path.lstat()
                 directory = stat.S_ISDIR(info.st_mode)
                 if linked(path):

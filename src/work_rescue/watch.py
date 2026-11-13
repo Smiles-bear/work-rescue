@@ -12,7 +12,8 @@ import uuid
 
 from filelock import FileLock, Timeout
 
-from .core import Engine, Project, RescueError, State, atomic_json, now
+from .core import Engine, Project, RescueError, State, WorktreeChanged, atomic_json, now
+from .git_worktrees import validate_binding
 
 
 def status(state: State, project: Project) -> dict:
@@ -40,6 +41,13 @@ def start(engine: Engine, project: Project, interval: int = 300) -> dict:
         raise RescueError("保存间隔至少为 5 秒")
     if status(engine.state, project)["running"]:
         raise RescueError("该项目后台已运行")
+    project = engine.state.get(project.id)
+    try:
+        validate_binding(project)
+    except WorktreeChanged:
+        if project.worktree and not project.worktree.paused:
+            engine.state.pause_worktree(project)
+        raise
     session = uuid.uuid4().hex
     env = os.environ.copy()
     env["WORK_RESCUE_PASSWORD"] = engine.backend.password
@@ -112,6 +120,9 @@ def run(engine: Engine, project: Project, interval: int):
 
     try:
         with FileLock(str(state.home / f"watch-{project.id}.lock"), timeout=0):
+            previous_success = status(state, project).get("last_success")
+            if previous_success:
+                value["last_success"] = previous_success
             thread = threading.Thread(target=heartbeat, daemon=True)
             thread.start()
             previous = None
@@ -125,6 +136,10 @@ def run(engine: Engine, project: Project, interval: int):
                                 value["last_success"] = saved
                             value["last_checked"] = now()
                             value["last_error"] = None
+                    except WorktreeChanged as exc:
+                        with guard:
+                            value["last_error"] = str(exc)
+                        return
                     except (RescueError, OSError, ValueError) as exc:
                         with guard:
                             value["last_error"] = str(exc).replace(

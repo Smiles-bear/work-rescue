@@ -34,6 +34,13 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("root", type=Path)
     add.add_argument("--include-ignored", action="append", default=[])
     add.add_argument("--goal", default="")
+    trees = commands.add_parser("worktrees", help="查看同一 Git 仓库的工作树和登记范围")
+    trees.add_argument("project")
+    trees.add_argument("--register", type=Path, metavar="PATH", help="登记指定工作树完整路径")
+    trees.add_argument("--name", help="登记名称")
+    trees.add_argument("--include-ignored", action="append", default=[])
+    trees.add_argument("--goal", default="")
+    trees.add_argument("--replace-paused", action="store_true", help="保留旧历史并登记新工作树")
     for name in ("scan", "save", "snapshots", "watch", "stop", "status"):
         sub = commands.add_parser(name)
         sub.add_argument("project")
@@ -69,6 +76,25 @@ def main(argv=None):
             output = [asdict(p) for p in state.projects()]
         elif command == "scan":
             output = scan(state.get(args.project))
+        elif command == "worktrees":
+            from .git_worktrees import discover
+
+            project = state.get(args.project)
+            if args.register is None:
+                output = discover(state, project)
+            else:
+                if not args.register.is_absolute():
+                    raise RescueError("请提供工作树完整路径")
+                output = asdict(
+                    state.register_worktree(
+                        project.id,
+                        args.register,
+                        args.name or args.register.name,
+                        args.include_ignored,
+                        args.goal,
+                        args.replace_paused,
+                    )
+                )
         elif command == "settings":
             output = (
                 state.set_interval(args.interval) if args.interval is not None else state.settings()

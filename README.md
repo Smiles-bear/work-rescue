@@ -20,6 +20,12 @@ python run.py
 
 终端内按 `Tab` 切换区域，方向键移动，`Enter` 选择；`a` 添加项目、`s` 保存、`v` 演练、`r` 恢复、`q` 退出界面。退出界面不会停止已经开启的独立后台；使用“停止后台”按钮明确停止。输入框内正常输入文字。
 
+### 保护并行 Git 工作树
+
+选中已登记的 Git 项目，按 `w` 或点击“工作树”。终端会列出 Git 识别到的本机工作树、各自的登记与后台状态、最近保存和演练结果。选择一棵工作树，确认完整路径并登记，然后在项目页保存、开启后台或恢复。每个登记目录有独立的检查点历史。已登记的普通项目也可以绑定到其完整工作树，保留已有的历史和设置。
+
+该流程适用于 Codex 和其他 Git 工具创建的本机工作树。工作树被移走、删除或检测到替换时，保护会在下一次保存检查中暂停。可以在项目页恢复已有检查点。需要保护复用同一路径的新工作树时，从同仓库项目的工作树列表选择“登记替换目录”，旧检查点仍保留在原项目名下。保护范围以最近成功的检查点为准。
+
 ## 从源码安装（三系统）
 
 需要 Python 3.12+ 和 uv。命令在项目根目录执行：
@@ -60,6 +66,8 @@ uv run work-rescue --restic "$PWD/.tools/restic"
 ```text
 work-rescue add my-project /absolute/project --include-ignored output/ --goal "完成脚本与报表"
 work-rescue scan my-project
+work-rescue worktrees my-project
+work-rescue worktrees my-project --register /absolute/worktree --name my-worktree
 work-rescue save my-project
 work-rescue snapshots my-project
 work-rescue verify <具体检查点ID>
@@ -74,13 +82,13 @@ work-rescue settings --interval 300
 work-rescue forget-password
 ```
 
-`verify` 执行完整仓库读取检查和实际恢复比对，可能比普通结构检查耗时。它与聊天能否继续是不同状态。`stop` 在正在进行的保存结束后停止后台。后台错误和最近成功时间可在界面及 `status` 查看，停止的心跳不会一直显示运行中。
+`worktrees` 使用本机 Git 查询登记范围，无需备份仓库口令。`verify` 执行完整仓库读取检查和实际恢复演练，输出原快照校验数量和可恢复文件数。它与聊天能否继续是不同状态。`stop` 在正在进行的保存结束后停止后台。后台错误和最近成功时间可在界面及 `status` 查看，停止的心跳不会一直显示运行中。
 
 ## 当前保护范围
 
 - 普通文件、未提交文件、新文件、显式选择的忽略产物；支持中文、空格、二进制和 CRLF。
 - 活跃 SQLite 主文件先与 WAL/回滚日志取得稳定私有副本，再生成独立逻辑备份；哈希针对该副本，不承诺与源数据库物理字节相同。
-- 逐级读取项目内 `.gitignore`，跳过被忽略的大目录，只在显式选择其产物时展开。目录排除项代表整棵子树。依赖缓存与 Git 内部目录不备份。
+- 逐级读取项目内 `.gitignore`，跳过被忽略的大目录，只在显式选择其产物时展开。目录排除项代表整棵子树。备份排除 Git 的 `.git` 目录和指针文件。旧检查点里的 `.git` 仍按原清单校验，恢复时跳过。
 - 常见凭据文件默认排除并显示原因；这不是完整的秘密检测器。
 - 空目录、符号链接、特殊文件暂不采集；ACL、扩展属性、NTFS 额外数据流尚不承诺保真。
 - 文件稳定采集不等于全项目同一瞬间事务。尚未落盘或检查点之后的内容可能丢失。
