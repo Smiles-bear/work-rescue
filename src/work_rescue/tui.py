@@ -34,7 +34,7 @@ def verification_label(engine: Engine, snapshot: str) -> str:
     try:
         value = json.loads(receipt.read_text(encoding="utf-8"))
         if value.get("snapshot_id") == snapshot and value.get("rehearsal") == "passed":
-            return "已通过" if "recoverable_file_count" in value else "旧版验证"
+            return "已通过" if value.get("final_files_verified") is True else "旧版验证"
     except (OSError, ValueError, AttributeError):
         pass
     return "未演练"
@@ -319,14 +319,40 @@ class RescueApp(App):
     def update_status(self):
         if self.selected_project:
             value = watch.status(self.engine.state, self.selected_project)
-            state = "运行中" if value["running"] else "未运行"
+            state = {
+                "starting": "启动中",
+                "waiting": "等待下次检查",
+                "saving": "保存中",
+                "retrying": "保存失败，等待重试",
+                "stalled": "长时间无新进度，请检查磁盘",
+                "stopped": "未运行",
+                "unknown": "状态不可读",
+            }[value["activity"]]
             message = f"{self.selected_project.name}  |  独立后台：{state}"
+            if value.get("activity") in ("saving", "stalled"):
+                phase = {
+                    "scanning": "扫描文件",
+                    "opening_repository": "打开备份仓库",
+                    "inspecting": "识别文件类型",
+                    "capturing": "采集文件",
+                    "saving": "写入加密备份",
+                }.get(value.get("phase"), "检查项目")
+                message += f"  |  {phase}"
+                if value.get("total_files") is not None:
+                    message += f" {value.get('completed_files', 0)}/{value['total_files']}"
+                message += f"  |  距上次进度 {value.get('progress_age_seconds', 0)} 秒"
+            if value.get("last_checked"):
+                message += f"  |  最近检查完成：{value['last_checked']}"
             if self.selected_project.worktree and not Path(self.selected_project.root).is_dir():
                 message += "  |  工作树目录不可用，可恢复已保存的检查点"
             if value.get("last_success"):
                 message += f"  |  最近自动保存：{value['last_success']['completed_at']}"
             if value.get("last_error"):
                 message += f"  |  保存失败：{value['last_error']}"
+            if value.get("consecutive_failures"):
+                message += f"  |  连续失败 {value['consecutive_failures']} 次"
+            if value.get("error"):
+                message += f"  |  {value['error']}"
         else:
             message = "请选择项目；尚未开启自动保护。原生聊天继续：未验证。"
         if self.busy:
@@ -580,7 +606,7 @@ class RescueApp(App):
             count = result["recoverable_file_count"]
             skipped = result["excluded_git_metadata_count"]
             self.write_log(f"恢复演练通过，可恢复 {count} 个文件，排除 {skipped} 个 Git 管理条目。")
-            await self.load_snapshots()
+        await self.load_snapshots()
 
     @work(group="operation")
     async def action_restore(self):

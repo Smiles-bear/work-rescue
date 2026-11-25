@@ -19,6 +19,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--home", type=Path, default=user_data_path("work-rescue", appauthor=False))
     result.add_argument("--repo", type=Path, help="加密备份仓库，默认在应用数据目录内")
     result.add_argument("--restic", help="restic 可执行文件路径")
+    result.add_argument(
+        "--timeout",
+        type=float,
+        default=1800,
+        help="单次备份后端命令超时秒数，默认 1800，最多 86400",
+    )
     result.add_argument("--remember", action="store_true", help="解锁成功后记住口令到系统凭据")
     result.add_argument("--no-keyring", action="store_true", help="本次不读取系统保存的口令")
     commands = result.add_subparsers(dest="command")
@@ -138,7 +144,7 @@ def main(argv=None):
                     "再次输入备份口令："
                 ):
                     raise RescueError("两次口令不一致")
-            engine = Engine(state, Restic(repository, password, args.restic))
+            engine = Engine(state, Restic(repository, password, args.restic, args.timeout))
             remember = args.remember
             if manual and command in ("tui", "init") and not args.no_keyring and not remember:
                 remember = (

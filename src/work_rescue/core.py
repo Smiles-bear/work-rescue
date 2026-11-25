@@ -12,6 +12,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -325,6 +326,41 @@ def stage_recovery(payload: Path, entries: list[dict], staged: Path) -> None:
             target.chmod(entry["mode"] & 0o777)
 
 
+def verify_recovered(directory: Path, entries: list[dict]) -> None:
+    check_source_path(directory, directory)
+    expected = {entry["path"] for entry in entries}
+    actual = set()
+    for path in directory.rglob("*"):
+        if linked(path):
+            raise RescueError("恢复结果包含链接，校验失败")
+        if path.is_file():
+            actual.add(path.relative_to(directory).as_posix())
+    if actual != expected:
+        raise RescueError("恢复后的文件集合与清单不一致")
+    for entry in entries:
+        path = directory / entry["path"]
+        check_source_path(directory, path)
+        if path.stat().st_size != entry["size"] or digest(path) != entry["sha256"]:
+            raise RescueError(f"恢复后的文件校验失败：{entry['path']}")
+
+
+def require_space(requirements: list[tuple[Path, int]]) -> None:
+    # Combine the simultaneously required copies when both paths share a volume.
+    volumes = {}
+    for directory, size in requirements:
+        device = directory.stat().st_dev
+        previous = volumes.get(device, (directory, 0))
+        volumes[device] = (directory, previous[1] + size)
+    for directory, size in volumes.values():
+        # Include a small estimate for directory entries and storage metadata.
+        needed = size + max(1024 * 1024, size // 20)
+        available = shutil.disk_usage(directory).free
+        if available < needed:
+            raise RescueError(
+                f"恢复空间不足（{directory}），预计至少需要 {needed} 字节，可用 {available} 字节"
+            )
+
+
 def scan(project: Project) -> dict:
     from .coverage import scan as project_scan
 
@@ -385,7 +421,16 @@ def sqlite_copy(source: Path, target: Path, scratch: Path, root: Path) -> None:
 
 
 class Restic:
-    def __init__(self, repository: Path, password: str, executable: str | None = None):
+    def __init__(
+        self,
+        repository: Path,
+        password: str,
+        executable: str | None = None,
+        timeout_seconds: float = 1800,
+    ):
+        if not 0 < timeout_seconds <= 86400:
+            raise RescueError("备份后端超时需要大于 0 秒且不超过 24 小时")
+        self.timeout_seconds = timeout_seconds
         self.repository = repository.expanduser().resolve()
         self.password = password
         self.executable = (
@@ -408,16 +453,22 @@ class Restic:
             if key.startswith("RESTIC_"):
                 del env[key]
         env["RESTIC_PASSWORD"] = self.password
-        result = subprocess.run(
-            [str(self.executable), "--repo", str(self.repository), "--no-cache", *args],
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        try:
+            result = subprocess.run(
+                [str(self.executable), "--repo", str(self.repository), "--no-cache", *args],
+                cwd=cwd,
+                env=env,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=self.timeout_seconds,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RescueError(
+                f"备份后端命令 {args[0]} 超过 {self.timeout_seconds:g} 秒，已终止，请检查磁盘后重试"
+            ) from exc
         if result.returncode:
             detail = (result.stderr or result.stdout).strip().replace(self.password, "[redacted]")
             raise RescueError(f"restic 操作失败（{result.returncode}）：{detail[:1200]}")
@@ -497,7 +548,12 @@ class Engine:
     def __init__(self, state: State, backend: Restic):
         self.state, self.backend = state, backend
 
-    def checkpoint(self, project: Project, previous_signature: str | None = None) -> dict:
+    def checkpoint(
+        self,
+        project: Project,
+        previous_signature: str | None = None,
+        progress: Callable[[dict], None] | None = None,
+    ) -> dict:
         root = Path(project.root).resolve()
         if overlaps(root, self.backend.repository) or overlaps(root, self.state.home):
             raise RescueError("备份仓库与应用数据目录不能与项目相互包含")
@@ -505,7 +561,7 @@ class Engine:
             with FileLock(str(self.state.home / f"{project.id}.lock"), timeout=0):
                 current = self._capture_project(project)
                 try:
-                    return self._checkpoint(current, previous_signature)
+                    return self._checkpoint(current, previous_signature, progress)
                 except WorktreeChanged:
                     if current.worktree and not current.worktree.paused:
                         self.state.pause_worktree(current)
@@ -517,13 +573,24 @@ class Engine:
         current = next((p for p in self.state.projects() if p.id == project.id), project)
         return replace(project, worktree=current.worktree)
 
-    def _checkpoint(self, project: Project, previous_signature: str | None = None) -> dict:
+    def _checkpoint(
+        self,
+        project: Project,
+        previous_signature: str | None = None,
+        progress: Callable[[dict], None] | None = None,
+    ) -> dict:
         from .git_worktrees import validate_binding
 
+        def report(phase, completed=0, total=None):
+            if progress:
+                progress({"phase": phase, "completed_files": completed, "total_files": total})
+
+        report("scanning")
         validate_binding(project)
         started = now()
         coverage = scan(project)
         root = Path(project.root)
+        report("opening_repository")
         self.backend.init()
         with tempfile.TemporaryDirectory(prefix="capture-", dir=self.state.home) as name:
             work = Path(name)
@@ -534,19 +601,21 @@ class Engine:
             scratch.mkdir()
             entries = []
             databases = set()
-            for relative in coverage["files"]:
+            report("inspecting", total=len(coverage["files"]))
+            for inspected, relative in enumerate(coverage["files"], 1):
                 source = root / relative
                 check_source_path(root, source)
                 with open_regular(source) as stream:
                     if stream.read(16) == b"SQLite format 3\x00":
                         databases.add(relative)
                 check_source_path(root, source)
+                report("inspecting", inspected, len(coverage["files"]))
             sidecars = {
                 name + suffix for name in databases for suffix in ("-wal", "-shm", "-journal")
             }
-            for relative in coverage["files"]:
-                if relative in sidecars:
-                    continue
+            selected = [relative for relative in coverage["files"] if relative not in sidecars]
+            report("capturing", total=len(selected))
+            for relative in selected:
                 source, target = root / relative, payload / relative
                 check_source_path(root, source)
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -566,6 +635,7 @@ class Engine:
                         "kind": "sqlite-logical" if relative in databases else "file",
                     }
                 )
+                report("capturing", len(entries), len(selected))
             validate_paths([entry["path"] for entry in entries], windows=False, insensitive=False)
             project_record = asdict(project)
             binding = project_record.pop("worktree")
@@ -599,6 +669,7 @@ class Engine:
                     "checked_at": now(),
                 }
             atomic_json(bundle / "manifest.json", manifest)
+            report("saving")
             output = self.backend.run(
                 "backup",
                 "--json",
@@ -616,7 +687,7 @@ class Engine:
             return {
                 "id": saved["snapshot_id"],
                 "file_count": len(entries),
-                "completed_at": manifest["completed_at"],
+                "completed_at": now(),
                 "signature": signature,
             }
 
@@ -661,12 +732,26 @@ class Engine:
 
     def verify(self, snapshot: str) -> dict:
         record = self._exact_snapshot(snapshot)
+        lock = FileLock(str(self.state.home / f"verify-{record['id']}.lock"), timeout=0)
+        try:
+            with lock:
+                receipt = self.state.home / "verification" / f"{record['id']}.json"
+                # An unsuccessful new rehearsal must not leave a previous green result.
+                receipt.unlink(missing_ok=True)
+                return self._verify(record)
+        except Timeout as exc:
+            raise RescueError("该检查点已有恢复演练运行中") from exc
+
+    def _verify(self, record: dict) -> dict:
+        size = self._restore_size(record["id"])
+        require_space([(self.state.home, size * 2)])
         self.backend.run("check", "--read-data")
         with tempfile.TemporaryDirectory(prefix="verify-", dir=self.state.home) as name:
             directory = Path(name)
             manifest, payload = self._extract(record["id"], directory / "extracted")
             entries = recoverable_files(manifest)
             stage_recovery(payload, entries, directory / "recovered")
+            verify_recovered(directory / "recovered", entries)
         result = {
             "snapshot_id": record["id"],
             "verified_at": now(),
@@ -674,6 +759,7 @@ class Engine:
             "recoverable_file_count": len(entries),
             "excluded_git_metadata_count": len(manifest["files"]) - len(entries),
             "rehearsal": "passed",
+            "final_files_verified": True,
             "native_session": "not_verified",
         }
         atomic_json(self.state.home / "verification" / f"{record['id']}.json", result)
@@ -739,13 +825,16 @@ class Engine:
         protected += [Path(p.root).resolve() for p in self.state.projects()]
         if any(overlaps(target, path) for path in protected):
             raise RescueError("恢复目标不能与原项目、备份仓库或应用数据相互包含")
+        record = self._exact_snapshot(snapshot)
+        size = self._restore_size(record["id"])
+        require_space([(self.state.home, size), (target.parent, size)])
         lock = FileLock(str(self.state.home / "restore.lock"), timeout=0)
         try:
             with (
                 lock,
                 tempfile.TemporaryDirectory(prefix="restore-", dir=self.state.home) as name,
             ):
-                manifest, payload = self._extract(snapshot, Path(name) / "extracted")
+                manifest, payload = self._extract(record["id"], Path(name) / "extracted")
                 # Also protect the source when recovering with an empty local configuration.
                 source = Path(manifest["project"]["root"]).resolve()
                 if overlaps(target, source):
@@ -757,22 +846,36 @@ class Engine:
                     raise RescueError("请在原仓库的工作树与 Git 管理目录之外选择恢复目标")
                 entries = recoverable_files(manifest)
                 check_restore_target(target)
+                require_space([(target.parent, sum(entry["size"] for entry in entries))])
                 with tempfile.TemporaryDirectory(
                     prefix=".work-rescue-", dir=target.parent
                 ) as staging:
                     staged = Path(staging) / "files"
                     stage_recovery(payload, entries, staged)
-                    self._publish(snapshot, staged, target)
+                    self._publish(record["id"], staged, target, entries)
         except Timeout as exc:
             raise RescueError("已有恢复任务正在运行") from exc
         return {
             "destination": str(target),
             "files": len(entries),
             "excluded_git_metadata_count": len(manifest["files"]) - len(entries),
+            "final_files_verified": True,
             "native_session": "not_verified",
         }
 
-    def _publish(self, snapshot: str, staged: Path, target: Path) -> None:
+    def _restore_size(self, snapshot: str) -> int:
+        try:
+            stats = json.loads(
+                self.backend.run("stats", snapshot, "--mode", "restore-size", "--json")
+            )
+            size = stats["total_size"]
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                raise ValueError("invalid size")
+            return size
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RescueError("备份后端未返回有效恢复大小") from exc
+
+    def _publish(self, snapshot: str, staged: Path, target: Path, entries: list[dict]) -> None:
         check_restore_target(target)
         operation = {
             "snapshot_id": snapshot,
@@ -791,7 +894,10 @@ class Engine:
         try:
             for child in staged.iterdir():
                 shutil.move(str(child), target / child.name)
-            operation.update(status="complete", completed_at=now())
+            operation["status"] = "verifying"
+            atomic_json(journal, operation)
+            verify_recovered(target, entries)
+            operation.update(status="complete", completed_at=now(), final_files_verified=True)
             atomic_json(journal, operation)
         except (OSError, RescueError) as exc:
             operation.update(status="incomplete", error=str(exc))
